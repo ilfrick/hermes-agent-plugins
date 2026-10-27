@@ -1,0 +1,25 @@
+name: ollama_memory
+version: "1.0.0"
+description: "Local semantic memory using Ollama embeddings (qwen3-embedding:4b default) with SQLite vector store. No cloud dependencies."
+author: "Nicola / Hermes Agent"
+license: MIT
+homepage: "https://github.com/NousResearch/hermes-agent"
+tags:
+  - memory
+  - embeddings
+  - ollama
+  - local-first
+  - semantic-search
+requires:
+  - python: ">=3.10"
+  - ollama: ">=0.1.0"  # server, not python package
+provides:
+  - memory_provider: ollama_memory
+  - tools:
+      - ollama_search
+      - ollama_remember
+      - ollama_forget
+      - ollama_status
+      - ollama_reindex
+config_schema: config_schema.py
+entry_point: "__init__:register"
