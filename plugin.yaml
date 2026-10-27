@@ -21,5 +21,4 @@ provides:
       - ollama_forget
       - ollama_status
       - ollama_reindex
-config_schema: config_schema.py
 entry_point: "__init__:register"

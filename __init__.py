@@ -295,9 +295,8 @@ class OllamaMemoryProvider(MemoryProvider):
         return "ollama_memory"
 
     def is_available(self) -> bool:
-        if not self._client:
-            return False
-        return self._client.health_check()
+        # Hermes calls this before initialize(); avoid a network call here.
+        return bool(self._endpoint and self._model)
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
