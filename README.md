@@ -8,7 +8,7 @@ Stores facts, preferences, and conversation context in a SQLite database with ve
 
 ## Features
 
-- **Semantic search** — find relevant memories by meaning, not keywords
+- **Hybrid search** — combine vector similarity with SQLite FTS5 lexical ranking for exact names, dates, numbers, and codes
 - **Local embeddings** — uses your Ollama instance (`qwen3-embedding:4b` or any compatible model)
 - **SQLite storage** — portable, no separate vector DB required
 - **Auto-mirror** — optionally mirrors built-in `memory.add`/`memory.replace` writes
@@ -38,7 +38,7 @@ No Python dependencies beyond stdlib + `requests` (already in Hermes).
 ```bash
 # On your Ollama host (192.168.10.20)
 ollama pull qwen3-embedding:4b
-# or any model that supports /api/embeddings
+# or any model that supports /api/embed (legacy /api/embeddings is also accepted)
 ```
 
 ---
@@ -57,6 +57,8 @@ memory:
     top_k: 8                                 # Default search results
     similarity_threshold: 0.25               # Cosine similarity cutoff (0-1)
     max_context_tokens: 1200                 # Max tokens in prefetch context
+    keep_alive: "10m"                         # Ask Ollama to keep the model loaded
+    prefetch_embedding_timeout: 5             # Bounded turn-start wait; then lexical fallback
     auto_embed_writes: true                  # Mirror built-in memory writes
     import_profile_files: false              # Explicit opt-in; sends profile text to endpoint
 ```
@@ -73,6 +75,8 @@ Or configure via the **Dashboard → Memory → Ollama Local Embeddings** panel.
 | `top_k` | integer | `8` | Default number of search results |
 | `similarity_threshold` | number | `0.25` | Cosine similarity cutoff (0–1) |
 | `max_context_tokens` | integer | `1200` | Token budget for prefetch context block |
+| `keep_alive` | string | `10m` | Duration Ollama should keep the embedding model loaded |
+| `prefetch_embedding_timeout` | number | `5` | Turn-start embedding wait, capped at 6 seconds before lexical fallback |
 | `auto_embed_writes` | boolean | `true` | Mirror `memory.add`/`replace` to Ollama store |
 | `import_profile_files` | boolean | `false` | Explicitly enable indexing of `MEMORY.md`, `USER.md`, and `SOUL.md` |
 
@@ -120,7 +124,7 @@ Expected output includes:
 
 | Tool | Purpose | Parameters |
 |------|---------|------------|
-| `ollama_search` | Semantic search | `query` (string, required), `top_k` (int, optional) |
+| `ollama_search` | Hybrid semantic + exact lexical search | `query` (string, required), `top_k` (int, optional) |
 | `ollama_remember` | Store a fact | `content` (string, required), `memory_type` (enum, optional), `importance` (0–1, optional) |
 | `ollama_forget` | Delete by ID | `memory_id` (int, required) |
 | `ollama_status` | Provider health & stats | — |
@@ -171,12 +175,12 @@ Expected output includes:
 
 ## How It Works
 
-1. **Initialization**: On gateway start, provider opens `~/.hermes/ollama_memory.db`; when `import_profile_files: true`, it also imports the active profile files `memories/MEMORY.md`, `memories/USER.md`, and `SOUL.md` (with legacy root-path fallback for `MEMORY.md` and `USER.md`)
-2. **Idempotence**: SHA-256 manifests skip unchanged source snapshots; changed files are appended as new snapshots, never replacing imported or user-created memories
-3. **Embedding**: Text → Ollama `/api/embeddings` → 2560-dim vector (for `qwen3-embedding:4b`)
-4. **Storage**: Content + embedding + source metadata stored in SQLite table `memories_<collection>`
-5. **Search**: Query embedded → cosine similarity against stored vectors → top-K filtered by threshold
-6. **Prefetch**: At each turn start, user query is embedded and searched; results injected as context block
+1. **Initialization**: On gateway start, provider opens `~/.hermes/ollama_memory.db`; when `import_profile_files: true`, it imports the active profile files `memories/MEMORY.md`, `memories/USER.md`, and `SOUL.md` (legacy root fallback for `MEMORY.md` and `USER.md`)
+2. **Idempotence**: Versioned SHA-256 manifests skip unchanged imports. A chunker-version change appends a new snapshot; prior rows remain intact.
+3. **Embedding**: Batched text → Ollama `/api/embed` (legacy `/api/embeddings` fallback) → vectors; recent embeddings are cached in-process and requests ask Ollama to keep the model loaded for `keep_alive`.
+4. **Storage**: Content, embeddings, section/source metadata, and versioned import manifests are stored in SQLite; FTS5 indexes content for exact-term retrieval.
+5. **Search**: Cosine similarity and FTS5 lexical ranks are fused with weighted reciprocal-rank fusion; exact-term results can surface even below the vector threshold.
+6. **Prefetch**: At turn start, the provider waits at most the configured embedding timeout (capped at 6 seconds), then falls back to local lexical search. Whole chunks are passed when they fit; oversized chunks use query-centered excerpts.
 7. **Sync**: Each conversation turn (user + assistant) is embedded and stored as `memory_type: "conversation"`
 8. **Mirror**: Built-in `memory.add`/`replace` calls are also embedded if `auto_embed_writes: true`
 
@@ -203,7 +207,8 @@ Indexes on `memory_type` and `created_at` for filtered scans.
 
 - **Scan-based search**: No FAISS/Annoy; linear scan capped at 5000 most recent rows
 - **Good for**: < 10k memories (typical personal use)
-- **Embedding latency**: ~50–200ms per call on LAN Ollama
+- **Embedding latency**: model- and load-dependent; batches reduce profile-import round trips, a 10-minute keep-alive reduces cold starts, and repeated text uses an in-memory LRU cache
+- **Prefetch resilience**: local FTS5 search remains available if Ollama embedding fails or exceeds the bounded prefetch timeout
 - **Reindex**: Sequential; allow minutes for thousands of memories
 
 For larger scale, consider adding FAISS or pgvector via a fork.
@@ -236,7 +241,7 @@ Import is disabled by default. Opting in sends the file text to the configured O
 
 For compatibility with older Hermes layouts, root-level `MEMORY.md` and `USER.md` are used only when their `memories/` counterparts are absent. The source Markdown files are never moved, rewritten, or deleted.
 
-Each document is split into bounded chunks and embedded by the configured Ollama endpoint. A SHA-256 import manifest makes startup idempotent: unchanged files are skipped; edited files are appended as a new snapshot, preserving prior records. Empty or missing files are ignored. If Ollama is unavailable during import, provider initialization continues, the files remain untouched, and the next initialization retries the import. Check `ollama_status` for the imported-source count.
+Each document is split into section-aware chunks of at most 480 characters and embedded in batches by the configured Ollama endpoint. A versioned SHA-256 import manifest makes startup idempotent: unchanged files are skipped; edited files or a new chunker version are appended as a new snapshot, preserving prior records. Each chunk stores its section label and source hash. Empty or missing files are ignored. If Ollama is unavailable during import, provider initialization continues, the files remain untouched, and the next initialization retries the import. Check `ollama_status` for the imported-source count.
 
 To import updated file contents, restart the Hermes gateway after saving the files. Existing built-in memory remains enabled; this feature adds a semantic index rather than replacing the Markdown source of truth.
 
