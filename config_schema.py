@@ -89,5 +89,14 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             inline=True,
             group="Behavior",
         ),
+        ProviderField(
+            key="import_profile_files",
+            label="Import Profile Files (opt-in)",
+            kind=KIND_BOOL,
+            default="false",
+            description="When enabled, the contents of MEMORY.md, USER.md, and SOUL.md are sent to the configured Ollama endpoint and added to this profile's local vector database.",
+            inline=True,
+            group="Behavior",
+        ),
     ),
 )

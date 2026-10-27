@@ -15,6 +15,7 @@ Config (config.yaml → memory.ollama_memory):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -40,6 +41,43 @@ _DEFAULT_TOP_K = 8
 _DEFAULT_SIMILARITY_THRESHOLD = 0.25
 _DEFAULT_MAX_CONTEXT_TOKENS = 1200
 _EMBED_DIM = 2560  # qwen3-embedding:4b dimension
+_IMPORT_CHUNK_CHARS = 1800
+_PROFILE_MEMORY_SOURCES = (
+    (("memories/MEMORY.md", "MEMORY.md"), "factual", 0.8),
+    (("memories/USER.md", "USER.md"), "preference", 0.8),
+    (("SOUL.md",), "instruction", 0.9),
+)
+
+
+def _split_for_embedding(text: str, max_chars: int = _IMPORT_CHUNK_CHARS) -> List[str]:
+    """Split long Markdown into bounded chunks without dropping text."""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+    paragraphs = [part.strip() for part in normalized.split("\n\n") if part.strip()]
+    chunks: List[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            chunks.append(current)
+            current = ""
+
+    for paragraph in paragraphs:
+        if len(paragraph) > max_chars:
+            flush()
+            for start in range(0, len(paragraph), max_chars):
+                chunks.append(paragraph[start:start + max_chars])
+            continue
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) > max_chars:
+            flush()
+            current = paragraph
+        else:
+            current = candidate
+    flush()
+    return chunks
 
 
 def _load_plugin_config() -> Dict[str, Any]:
@@ -158,6 +196,16 @@ class _MemoryStore:
                 CREATE INDEX IF NOT EXISTS idx_memories_{self.collection}_created
                 ON memories_{self.collection}(created_at)
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ollama_memory_imports (
+                    collection TEXT NOT NULL,
+                    source_file TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    chunk_count INTEGER NOT NULL,
+                    imported_at TEXT NOT NULL,
+                    PRIMARY KEY (collection, source_file, content_hash)
+                )
+            """)
             conn.commit()
 
     def add(self, content: str, embedding: List[float], memory_type: str = "factual",
@@ -173,6 +221,60 @@ class _MemoryStore:
             (content, emb_bytes, memory_type, importance, meta_json, now, now))
         conn.commit()
         return cur.lastrowid
+
+    def source_imported(self, source_file: str, content_hash: str) -> bool:
+        conn = self._get_conn()
+        with self._lock:
+            row = conn.execute(
+                "SELECT 1 FROM ollama_memory_imports "
+                "WHERE collection = ? AND source_file = ? AND content_hash = ? LIMIT 1",
+                (self.collection, source_file, content_hash),
+            ).fetchone()
+        return row is not None
+
+    def import_source(self, source_file: str, content_hash: str, chunks: List[str],
+                      embeddings: List[List[float]], memory_type: str, importance: float) -> bool:
+        """Atomically append a source snapshot and its import marker; never replace prior data."""
+        if not chunks or len(chunks) != len(embeddings):
+            raise ValueError("source chunks and embeddings must be non-empty and have equal lengths")
+        now = datetime.now(UTC).isoformat()
+        conn = self._get_conn()
+        with self._lock:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT 1 FROM ollama_memory_imports "
+                    "WHERE collection = ? AND source_file = ? AND content_hash = ? LIMIT 1",
+                    (self.collection, source_file, content_hash),
+                ).fetchone()
+                if existing:
+                    conn.rollback()
+                    return False
+                for index, (content, embedding) in enumerate(zip(chunks, embeddings), start=1):
+                    metadata = json.dumps({
+                        "source_file": source_file,
+                        "source_sha256": content_hash,
+                        "chunk_index": index,
+                        "chunk_count": len(chunks),
+                    }, ensure_ascii=False)
+                    conn.execute(
+                        f"""INSERT INTO memories_{self.collection}
+                            (content, embedding, memory_type, importance, metadata, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (content, json.dumps(embedding).encode(), memory_type, importance,
+                         metadata, now, now),
+                    )
+                conn.execute(
+                    "INSERT INTO ollama_memory_imports "
+                    "(collection, source_file, content_hash, chunk_count, imported_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (self.collection, source_file, content_hash, len(chunks), now),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
 
     def search(self, query_embedding: List[float], top_k: int = 8,
                threshold: float = 0.25, memory_type: Optional[str] = None) -> List[Dict]:
@@ -230,7 +332,12 @@ class _MemoryStore:
     def stats(self) -> Dict:
         conn = self._get_conn()
         row = conn.execute(f"SELECT COUNT(*) as cnt FROM memories_{self.collection}").fetchone()
-        return {"collection": self.collection, "count": row["cnt"], "dimension": self.dim}
+        imported = conn.execute(
+            "SELECT COUNT(DISTINCT source_file) AS cnt FROM ollama_memory_imports WHERE collection = ?",
+            (self.collection,),
+        ).fetchone()
+        return {"collection": self.collection, "count": row["cnt"], "dimension": self.dim,
+                "imported_sources": imported["cnt"]}
 
     def reindex(self, client: _OllamaClient) -> Tuple[int, int]:
         """Recompute all embeddings using current client. Returns (updated, failed)."""
@@ -307,6 +414,7 @@ class OllamaMemoryProvider(MemoryProvider):
             {"key": "similarity_threshold", "description": "Cosine similarity cutoff 0-1", "type": "number", "default": _DEFAULT_SIMILARITY_THRESHOLD},
             {"key": "max_context_tokens", "description": "Max tokens in prefetch context block", "type": "integer", "default": _DEFAULT_MAX_CONTEXT_TOKENS},
             {"key": "auto_embed_writes", "description": "Mirror built-in memory.add to Ollama store", "type": "boolean", "default": True},
+            {"key": "import_profile_files", "description": "Opt in to embedding MEMORY.md, USER.md and SOUL.md at the configured endpoint", "type": "boolean", "default": False},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -326,8 +434,61 @@ class OllamaMemoryProvider(MemoryProvider):
         self._client = _OllamaClient(self._endpoint, self._model)
         self._store = _MemoryStore(home / "ollama_memory.db", self._collection)
         self._initialized = True
+        self._import_profile_files(home)
         logger.info("OllamaMemoryProvider initialized: endpoint=%s model=%s collection=%s",
                     self._endpoint, self._model, self._collection)
+
+    def _import_profile_files(self, home: Path) -> None:
+        """Append opted-in profile Markdown snapshots without escaping the active profile."""
+        enabled = self._config.get("import_profile_files", False)
+        if not (enabled is True or isinstance(enabled, str)
+                and enabled.strip().lower() in {"1", "true", "yes", "on"}):
+            return
+        client, store = self._client, self._store
+        if client is None or store is None:
+            return
+        home_root = home.resolve()
+        for candidates, memory_type, importance in _PROFILE_MEMORY_SOURCES:
+            source_path = None
+            source_file = None
+            for candidate in candidates:
+                candidate_path = home / candidate
+                try:
+                    resolved_path = candidate_path.resolve(strict=True)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning("Could not resolve profile source %s (%s)",
+                                   candidate, type(exc).__name__)
+                    continue
+                try:
+                    resolved_path.relative_to(home_root)
+                except ValueError:
+                    logger.warning("Refusing profile source outside active home: %s", candidate)
+                    continue
+                if resolved_path.is_file():
+                    source_path = resolved_path
+                    source_file = candidate
+                    break
+            if source_path is None or source_file is None:
+                continue
+            try:
+                text = source_path.read_text(encoding="utf-8", errors="replace").strip()
+                chunks = _split_for_embedding(text)
+                if not chunks:
+                    continue
+                content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if store.source_imported(source_file, content_hash):
+                    continue
+                embeddings = [client.embed(chunk) for chunk in chunks]
+                if store.import_source(source_file, content_hash, chunks, embeddings,
+                                       memory_type, importance):
+                    logger.info("Imported %d chunks from profile memory source %s",
+                                len(chunks), source_file)
+            except Exception as exc:
+                # Never log source contents; files can contain private user and assistant data.
+                logger.warning("Could not import profile memory source %s (%s)",
+                               source_file, type(exc).__name__)
 
     def system_prompt_block(self) -> str:
         if not self._initialized:

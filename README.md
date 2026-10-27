@@ -12,6 +12,7 @@ Stores facts, preferences, and conversation context in a SQLite database with ve
 - **Local embeddings** — uses your Ollama instance (`qwen3-embedding:4b` or any compatible model)
 - **SQLite storage** — portable, no separate vector DB required
 - **Auto-mirror** — optionally mirrors built-in `memory.add`/`memory.replace` writes
+- **Profile import (opt-in)** — indexes `MEMORY.md`, `USER.md`, and `SOUL.md` only when explicitly enabled
 - **Tool integration** — `ollama_search`, `ollama_remember`, `ollama_forget`, `ollama_status`, `ollama_reindex`
 - **Multiplex-safe** — profile-scoped database, works with `hermes multiplex`
 - **Zero config default** — works out of the box with `http://192.168.10.20:11434`
@@ -57,6 +58,7 @@ memory:
     similarity_threshold: 0.25               # Cosine similarity cutoff (0-1)
     max_context_tokens: 1200                 # Max tokens in prefetch context
     auto_embed_writes: true                  # Mirror built-in memory writes
+    import_profile_files: false              # Explicit opt-in; sends profile text to endpoint
 ```
 
 Or configure via the **Dashboard → Memory → Ollama Local Embeddings** panel.
@@ -72,6 +74,7 @@ Or configure via the **Dashboard → Memory → Ollama Local Embeddings** panel.
 | `similarity_threshold` | number | `0.25` | Cosine similarity cutoff (0–1) |
 | `max_context_tokens` | integer | `1200` | Token budget for prefetch context block |
 | `auto_embed_writes` | boolean | `true` | Mirror `memory.add`/`replace` to Ollama store |
+| `import_profile_files` | boolean | `false` | Explicitly enable indexing of `MEMORY.md`, `USER.md`, and `SOUL.md` |
 
 ---
 
@@ -80,6 +83,9 @@ Or configure via the **Dashboard → Memory → Ollama Local Embeddings** panel.
 ```bash
 # Set as active memory provider
 hermes config set memory.provider ollama_memory
+
+# Explicitly opt in to importing profile data at the configured Ollama endpoint
+hermes config set --force memory.ollama_memory.import_profile_files true
 
 # Restart gateway to load the provider
 hermes gateway restart
@@ -99,9 +105,12 @@ Expected output includes:
   "collection": "hermes_memory",
   "initialized": true,
   "available": true,
-  "count": 0
+  "count": 3,
+  "imported_sources": 3
 }
 ```
+
+`count` is the total number of stored chunks and user-added memories; it can exceed the number of source files when a document is split into multiple chunks.
 
 ---
 
@@ -162,13 +171,14 @@ Expected output includes:
 
 ## How It Works
 
-1. **Initialization**: On gateway start, provider connects to Ollama, creates/opens `~/.hermes/ollama_memory.db`
-2. **Embedding**: Text → Ollama `/api/embeddings` → 2560-dim vector (for `qwen3-embedding:4b`)
-3. **Storage**: Content + embedding + metadata stored in SQLite table `memories_<collection>`
-4. **Search**: Query embedded → cosine similarity against stored vectors → top-K filtered by threshold
-5. **Prefetch**: At each turn start, user query is embedded and searched; results injected as context block
-6. **Sync**: Each conversation turn (user + assistant) is embedded and stored as `memory_type: "conversation"`
-7. **Mirror**: Built-in `memory.add`/`replace` calls are also embedded if `auto_embed_writes: true`
+1. **Initialization**: On gateway start, provider opens `~/.hermes/ollama_memory.db`; when `import_profile_files: true`, it also imports the active profile files `memories/MEMORY.md`, `memories/USER.md`, and `SOUL.md` (with legacy root-path fallback for `MEMORY.md` and `USER.md`)
+2. **Idempotence**: SHA-256 manifests skip unchanged source snapshots; changed files are appended as new snapshots, never replacing imported or user-created memories
+3. **Embedding**: Text → Ollama `/api/embeddings` → 2560-dim vector (for `qwen3-embedding:4b`)
+4. **Storage**: Content + embedding + source metadata stored in SQLite table `memories_<collection>`
+5. **Search**: Query embedded → cosine similarity against stored vectors → top-K filtered by threshold
+6. **Prefetch**: At each turn start, user query is embedded and searched; results injected as context block
+7. **Sync**: Each conversation turn (user + assistant) is embedded and stored as `memory_type: "conversation"`
+8. **Mirror**: Built-in `memory.add`/`replace` calls are also embedded if `auto_embed_writes: true`
 
 ### Database Schema
 
@@ -204,23 +214,31 @@ For larger scale, consider adding FAISS or pgvector via a fork.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `available: false` | Ollama unreachable | Check `endpoint`, firewall, `ollama serve` |
+| `available: false` | Endpoint or model is unset | Configure the provider settings |
 | `embedding dimension mismatch` | Model changed | Run `ollama_reindex` or change `collection` |
 | `No relevant memories found` | Threshold too high | Lower `similarity_threshold` (try 0.15) |
 | Slow search | Too many memories | Increase threshold, reduce `top_k` |
 | Duplicate memories | Multiple `remember` calls | Use `ollama_forget` + re-add, or accept duplicates |
 
+Provider availability only confirms that endpoint and model settings are present; it does not health-check Ollama. To validate reachability, call `ollama_status` or query `GET <endpoint>/api/tags` separately.
+
 ---
 
-## Migration from File Memory
+## Import from Profile Files
 
-If you previously used file-based memory (`MEMORY.md`, `USER.md`), the provider does **not** auto-import them. To migrate:
+When `memory.ollama_memory.import_profile_files: true`, the plugin indexes these files from the active `$HERMES_HOME`:
 
-```bash
-# 1. Export current memory (if using a tool that supports it)
-# 2. Use ollama_remember for each fact you want to keep
-# 3. Or write a one-off script to batch-import from MEMORY.md
-```
+- `memories/MEMORY.md` — factual memory
+- `memories/USER.md` — user profile and preferences
+- `SOUL.md` — assistant identity and operating principles
+
+Import is disabled by default. Opting in sends the file text to the configured Ollama endpoint to compute embeddings; use this only when you trust that endpoint and its network path. The source files remain read-only, and resolved paths outside the active profile are rejected. The resulting content and vectors are stored in the profile's local SQLite database.
+
+For compatibility with older Hermes layouts, root-level `MEMORY.md` and `USER.md` are used only when their `memories/` counterparts are absent. The source Markdown files are never moved, rewritten, or deleted.
+
+Each document is split into bounded chunks and embedded by the configured Ollama endpoint. A SHA-256 import manifest makes startup idempotent: unchanged files are skipped; edited files are appended as a new snapshot, preserving prior records. Empty or missing files are ignored. If Ollama is unavailable during import, provider initialization continues, the files remain untouched, and the next initialization retries the import. Check `ollama_status` for the imported-source count.
+
+To import updated file contents, restart the Hermes gateway after saving the files. Existing built-in memory remains enabled; this feature adds a semantic index rather than replacing the Markdown source of truth.
 
 ---
 
