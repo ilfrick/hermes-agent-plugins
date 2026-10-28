@@ -4,7 +4,7 @@ Local-first semantic memory using Ollama embeddings (default: qwen3-embedding:4b
 and SQLite for storage. No external dependencies beyond Ollama HTTP API and stdlib.
 
 Config (config.yaml → memory.ollama_memory):
-  endpoint: "http://192.168.10.20:11434"   # Ollama API base URL
+  endpoint: "http://localhost:11434"   # Ollama API base URL
   model: "qwen3-embedding:4b"              # Embedding model name
   collection: "hermes_memory"              # Logical collection / table suffix
   top_k: 8                                 # Default search results
@@ -36,7 +36,7 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ENDPOINT = "http://192.168.10.20:11434"
+_DEFAULT_ENDPOINT = "http://localhost:11434"
 _DEFAULT_MODEL = "qwen3-embedding:4b"
 _DEFAULT_COLLECTION = "hermes_memory"
 _DEFAULT_TOP_K = 8

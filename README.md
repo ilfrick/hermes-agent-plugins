@@ -15,7 +15,7 @@ Stores facts, preferences, and conversation context in a SQLite database with ve
 - **Profile import (opt-in)** — indexes `MEMORY.md`, `USER.md`, and `SOUL.md` only when explicitly enabled
 - **Tool integration** — `ollama_search`, `ollama_remember`, `ollama_forget`, `ollama_status`, `ollama_reindex`
 - **Multiplex-safe** — profile-scoped database, works with `hermes multiplex`
-- **Zero config default** — works out of the box with `http://192.168.10.20:11434`
+- **Zero config default** — works out of the box with `http://localhost:11434`
 
 ---
 
@@ -36,7 +36,7 @@ No Python dependencies beyond stdlib + `requests` (already in Hermes).
 **Prerequisite**: Ollama running with an embedding model:
 
 ```bash
-# On your Ollama host (192.168.10.20)
+# On the machine running Ollama (localhost)
 ollama pull qwen3-embedding:4b
 # or any model that supports /api/embed (legacy /api/embeddings is also accepted)
 ```
@@ -51,7 +51,7 @@ Add to `config.yaml` under `memory.ollama_memory`:
 memory:
   provider: ollama_memory
   ollama_memory:
-    endpoint: "http://192.168.10.20:11434"   # Ollama API base URL
+    endpoint: "http://localhost:11434"   # Ollama API base URL
     model: "qwen3-embedding:4b"              # Embedding model name
     collection: "hermes_memory"              # Logical collection / table suffix
     top_k: 8                                 # Default search results
@@ -69,7 +69,7 @@ Or configure via the **Dashboard → Memory → Ollama Local Embeddings** panel.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint` | string | `http://192.168.10.20:11434` | Ollama API base URL (protocol + host + port) |
+| `endpoint` | string | `http://localhost:11434` | Ollama API base URL (protocol + host + port) |
 | `model` | string | `qwen3-embedding:4b` | Embedding model name (must be pulled on Ollama host) |
 | `collection` | string | `hermes_memory` | Table suffix; changing creates a new isolated store |
 | `top_k` | integer | `8` | Default number of search results |
@@ -104,7 +104,7 @@ hermes chat -q "Use ollama_status to check the memory provider"
 Expected output includes:
 ```json
 {
-  "endpoint": "http://192.168.10.20:11434",
+  "endpoint": "http://localhost:11434",
   "model": "qwen3-embedding:4b",
   "collection": "hermes_memory",
   "initialized": true,
